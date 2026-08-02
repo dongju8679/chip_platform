@@ -1,0 +1,4 @@
+spike (riscv-isa-sim)
+requires: riscv-isa-sim installed as library ($RISCV/lib/libriscv)
+api: processor_t::{get_mmu,get_state,step}, mmu_t::{load_uint32,store_uint32,load_uint64}, state.mip
+note: sim_t ctor signature varies by version; adjust in verif_spike.h::load_elf

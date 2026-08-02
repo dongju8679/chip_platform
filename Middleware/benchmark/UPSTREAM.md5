@@ -1,0 +1,9 @@
+9007fe7861b60ee6f210d156b62974c8  coremark/core_list_join.c
+4a9e6dadce1ac3866381021fbe843fc9  coremark/core_main.c
+5fa21a0f7c3964167c9691db531ca652  coremark/core_matrix.c
+fb49e7605c125306575a83f14f5798ac  coremark/core_state.c
+45540ba2145adea1ec7ea2c72a1fbbcb  coremark/core_util.c
+b0ec69b6c8e75853d06accb3b1bcf534  coremark/coremark.h
+7c7b0b91629b4df8ba1472fdc285ce74  dhrystone/dhrystone.c
+dd6499138b72b20c56f80d3e3c579998  dhrystone/dhrystone_main.c
+10c2ac185d780899f5594fc9465d8f4d  dhrystone/dhrystone.h

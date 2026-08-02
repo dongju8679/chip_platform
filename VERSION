@@ -1,0 +1,188 @@
+chip_platform
+version: 2.24.0 (environment-specific paths removed)
+date: 2026-08-01
+changes:
+  - Removed all hardcoded personal and machine-specific paths from the tree.
+      * the pristine-tree guards in ci/run_regress.sh, setup_custom_riscv.sh,
+        verif/build_all.sh and every per-case run.sh rejected $HOME/chipyard and
+        $HOME/chipyard-benchmark by name. That test is meaningless on any other
+        machine and blocked legitimate trees, so it is gone.
+      * CHIPYARD, CY, RISCV, DV, VENV and STUB no longer default to a specific
+        home directory. They now use ${VAR:?message} so an unset variable fails
+        immediately with a clear message instead of silently pointing somewhere
+        that does not exist.
+      * .vscode/launch.json and tasks.json now reference ${env:RISCV} and
+        ${env:CY} rather than absolute paths.
+      * In-tree documentation uses placeholders in place of absolute paths.
+      * The tree directory is named chip_platform. The earlier
+        chip_platform_verif_noko name was a temporary label from the
+        Korean-removal pass and no longer appears anywhere.
+      * vp/spike/verif_* removed from the tree. They are compiled host x86-64
+        binaries carrying an absolute RUNPATH, so a copy from another machine is
+        never usable and, worse, run_regress.sh will not rebuild a file that
+        exists - leaving a stale libriscv silently in use. They are now built by
+        setup_custom_riscv.sh --rebuild-vp and listed in .gitignore.
+
+  - Platform/Common/Inc/verif_mbx_base.h added. One base address, VERIF_MBX_BASE,
+    with every mailbox offset derived from it. Default 0x80010000 is unchanged,
+    so RV32RocketConfig targets behave exactly as before.
+
+    Derived from it now:
+      Platform/Common/Inc/util.h              BREAK_POINT_ADDR
+      Platform/Common/Inc/verif_ca.h          cycle/instret mirrors, CA table
+      verif/backend/chipyard/verif_addr_chipyard.h   host-side equivalents
+      verif/ip/S5740/WFI/.../WFI_hostAccess.h TEST_DEBUG_BASE_ADDR
+      verif/ip/S5740/BENCH/smoke/Src/BENCH_smoke.c   scratch word
+
+    To relocate on a target where 0x80010000 is not writable data memory:
+      EXTRA_CFLAGS="-DPRELOAD -DVERIF_MBX_BASE=0x80038000u"
+    The host build needs the same value; the offsets are duplicated in
+    verif_addr_chipyard.h because host and DUT share no include path.
+
+    Why: bp_init() stores to BREAK_POINT_ADDR on the boot path, before main.
+    On SCRConfig the default lands in ITIM and the store faults, so nothing
+    else gets a chance to run. Per-test headers still carry their own literals
+    and are listed in HARDCODED_ADDRESS_AUDIT.md.
+
+  - Platform/Chipset/TinyRocket/link.vwp3.ld added. ITIM holds .text only;
+    .rodata, .data, .bss, heap and stack all go to DTIM.
+      code 0x80000000 64K   (ITIM, instruction fetch only)
+      data 0x80020000 128K  (DTIM)
+
+    Why link.vwp2.ld was not enough: it left .rodata in ITIM on the assumption
+    that read-only data belongs with read-only code. GCC compiles a switch into
+    a jump table in .rodata and reads it with a plain load, so that load hits
+    instruction memory and faults. Observed in CoreMark get_seed_32 at cycle
+    2794 (0x800026a2), trapping to _trap_vector_entry and ending in
+    exit(CODE_FATAL). This matches mem_test.riscv, which keeps only 6.5K of code
+    at 0x80000000 and places all 17K of everything else at 0x80020000.
+
+  - Platform/Common/Inc/util.h: BREAK_POINT_ADDR wrapped in #ifndef so the host
+    mailbox can be relocated per target. On SCRConfig the stock 0x80010000 falls
+    inside ITIM. Build with e.g.
+      EXTRA_CFLAGS="-DPRELOAD -DBREAK_POINT_ADDR=0x80038000"
+
+  - Platform/Chipset/TinyRocket/link.vwp2.ld added: second VWP variant, using
+    only the two memory regions the working sample on that machine uses.
+      0x80000000  code (text/rodata)                        32K
+      0x80020000  tohost/fromhost, data, bss, heap, stack   64K
+      0x80002000..0x8001FFFF  deliberately unused
+    Select it per build:
+      make -f Implementation/Makefile.VERIF ... \
+           LDSCRIPT=Platform/Chipset/TinyRocket/link.vwp2.ld
+
+    Why: with link.vwp.ld the harness did read our exit code, so HTIF works -
+    but the firmware exited with CODE_FATAL (2) after about 23 ms of simulated
+    time, which is the trap handler reporting an unexpected exception during
+    boot. The stock layout assumes one contiguous 60K region and puts the stack
+    at 0x8000F000, inside the gap that mem_test.riscv avoids. If that range is
+    not backed by memory on this SoC, the first stack push faults.
+    HYPOTHESIS - the SoC memory map has not been confirmed.
+
+  - Platform/Chipset/TinyRocket/link.vwp.ld added: VWP/HPC (xcelium) variant of
+    link.ld that pins tohost/fromhost to fixed addresses.
+      tohost   0x80020000
+      fromhost 0x80020040
+    Select it per build:
+      make -f Implementation/Makefile.VERIF ... \
+           LDSCRIPT=Platform/Chipset/TinyRocket/link.vwp.ld
+    link.ld itself is UNCHANGED, so dscloud behaviour is not affected.
+
+    Why: a CoreMark ELF ran 582 s under xcelium and exited normally with no
+    console output. A working sample there (mem_test.riscv) has tohost at
+    0x80020000 while the stock script left ours at 0x80004148, which suggests
+    the harness watches a fixed address rather than resolving the ELF symbol.
+    NOT yet confirmed with the hardware team - see HTIF_ADDRESS_QUESTIONS.md.
+    The 0x40 gap between tohost and fromhost is reproduced on the assumption
+    that it is required.
+
+  - NOKO_CLEANUP.md moved to chip_docs_verif/verif/. It is a record of the
+    Korean-removal pass, not something a user of the tree needs; the tree keeps
+    only what is required to build and run.
+  - env.sh removed from the tree root. It was a 0-byte stub and nothing
+    referenced it - every "env.sh" in the scripts refers to $CHIPYARD/env.sh.
+  - CUSTOM_TOOLCHAIN.md stays: it is the usage document for
+    setup_custom_riscv.sh, which sits next to it.
+
+  - verif/ip/S5740/CA/measure/ca_compare3.py now accepts both "[verif]" (chipyard
+    host) and "[verif_spike]" (verif_spike_run) table prefixes. Previously a
+    model log had to be rewritten with sed before it could be compared.
+  - verif/ip/S5740/CA/measure/spike_compare.py removed. ca_compare3.py is a
+    superset: pass '-' as the first argument for the two-way view it used to
+    provide, or three logs for the full comparison.
+  - verif/ip/S5740/I2SR/int_muldiv/Vseq/I2SR_int_muldiv.cc: leftover debug
+    fprintf removed.
+
+  - default paths now target the dscloud reference environment, with the
+    VWP/HPC values kept alongside as commented lines. To move between the two,
+    comment one block and uncomment the other; ~/.scr_env wins over both.
+
+      variable         dscloud (active)              VWP/HPC (commented)
+      ---------------- ----------------------------- ---------------------------
+      SPIKE_INSTALL    /share/opt/spike              /user/rocket/opt/spike
+      RISCV_TOOLCHAIN  /share/opt/toolchain/         /user/rocket/opt/toolchain/
+                       gcc13.2_fastinterrupt         gcc13.2_fastinterrupt
+      OUT_PREFIX       $HOME/test_merge_out          /user/rocket/users/dongju2/
+      = RISCV                                        test_merge_out
+      GCC64_PREFIX     /tools/chipyard/              /user/rocket/chipyard/
+                       .conda-env/riscv-tools        .conda-env/riscv-tools
+      CHIPYARD         $HOME/_project/chipyard       /user/rocket/users/dongju2/
+                                                     _project/chipyard
+
+    Touched: setup_custom_riscv.sh, ci/run_regress.sh, Implementation/Makefile.VERIF
+    . the previous defaults pointed at one developer's home directory and could
+      not resolve anywhere else; ci/run_regress.sh in particular pointed at a
+      path that no longer existed
+  - setup_custom_riscv.sh and ci/run_regress.sh now source ~/.scr_env when it
+    exists, so a machine that is not the reference environment overrides the
+    defaults in one file instead of on every command line.
+    Precedence: command-line argument > environment > ~/.scr_env > default.
+    See scr_env.example.
+  - scr_env.example added (copy to ~/.scr_env and edit)
+
+note on host binaries:
+  - spike, vp/spike/verif_*, and the rv32 toolchain are host x86-64 programs and
+    must NOT be copied between machines. A spike built on Ubuntu 24.04 requires
+    GLIBC_2.33/2.34/2.38, which a conda sysroot does not provide, so the link
+    fails with undefined references (fstat@GLIBC_2.33, pthread_join@GLIBC_2.34,
+    __libc_single_threaded@GLIBC_2.32). glibc is backward compatible only.
+    Build them on the target machine, inside the same environment used to run
+    them (activate the chipyard conda env first where one is in use).
+
+previous:
+  chip_platform
+  version: 2.14.0-v304 (v2.13.0 + three-way CA comparison tool)
+  date: 2026-07-31
+  changes:
+    - verif/ip/S5740/CA/measure/ca_compare3.py added: three-way CA_measure
+      comparison (functional spike / spike+timing_model / RTL) in one table.
+      . superset of spike_compare.py; pass - as the first argument for a
+        two-way (model vs RTL) view
+      . instruction counts must match across all three; only cycles differ
+    - .attic/ removed (retired timer.c/timer.h from the Platform/Common
+      promotion; the history is preserved in the v3.01.0 snapshot)
+
+  chip_platform
+  version: 2.13.0-v304 (v2.12.0 verif_host refactor + newlib stdio + VSCode GDB)
+  date: 2026-07-26
+  changes:
+    - newlib nano stdio adopted (standard printf, %f, 512B heap)
+      . USE_NEWLIB_STDIO=0 reproduces the pre-newlib baseline byte for byte
+    - VSCode GDB (cppdbg, launch/tasks.json)
+
+status (updated 2026-07-29):
+  - RTL 8/8 PASS on chipyard 1.13.0 / RV32RocketConfig / verilator.
+    The 8 cases (ci/run_regress.sh TESTS, ordered by RTL runtime):
+      CLINT_sw_interrupt  EXCEPTION_traps  PMP_violation     CA_measure
+      BENCH_dhrystone     BENCH_coremark   FREERTOS_preempt  UART_printf
+  - CLINT_sw_interrupt: the chipyard co-sim latent defect noted in v304 is FIXED.
+    Two changes were needed:
+      1. verif_host.h now runs a DUT boot barrier (wait_dut_ready) before any host
+         sequence, so bp_init()'s BP_TEST_init no longer clobbers the Vseq's opening
+         host_set_bp(BP_TEST_begin).
+      2. the Vseq releases dut_wait_bp(BP_TEST_success) at the end of every round,
+         so the final round is not left spinning.
+  - Known non-passing case: CLINT_timer_interrupt does not complete on RTL
+    (3600s timeout). See verif/ip/S5740/S5740.list for the root-cause note.
+    Do NOT add it to ci/run_regress.sh TESTS - run_rtl() has no timeout, so the
+    regression would hang forever.

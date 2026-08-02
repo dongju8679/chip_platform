@@ -1,0 +1,432 @@
+# Makefile.VERIF  (chip_platform_v2 / Implementation) - VERIF co-sim frame
+#
+# Follows the Makefile.TinyRocket pattern. Differences:
+#   - target sources = VERIF/S5740/<F>/<SF>/Src/*.c  (firmware = target code)
+#   - BSP = Platform/Chipset/TinyRocket (start.S/link.ld/hal.h + hal_shim)
+#   - DUT(CONFIG) default = RV32CosimConfig (host-accessible memory; for co-sim)
+#       - for self-check track only, CONFIG=TinyRocketConfig also works (existing PASS path)
+#
+# This Makefile builds only the "firmware ELF". The host co-sim (verif_tsi_t) is injected into
+# the chipyard sim harness and built together at elaboration (see VERIF/host/*, chipyard_overlay).
+#
+# Usage:
+#   make -f Makefile.VERIF F=CLINT SF=rtc                       # firmware ELF
+#   make -f Makefile.VERIF F=CLINT SF=rtc run-verilator         # run on DUT
+#   (CHIPYARD=~/chipyard_v110, CONFIG=RV32CosimConfig by default)
+
+# -- Firmware toolchain ------------------------------------------
+#   v304-newlib: conda(riscv64-unknown-elf-) -> rv32-multilib(riscv32-unknown-elf-)
+#
+#   Why the change: the conda toolchain's multilib list is just "." so it has no
+#   libc.a/libgcc.a for rv32imac/ilp32. This build therefore had to work around
+#   that with -nostdlib and hand-implement printf/puts/putchar and even 64-bit
+#   division (Platform/Common/Src/printf.c, 271 lines).
+#   rv32-multilib ships newlib for the rv32imac/ilp32 + rv32imfc/ilp32f
+#   multilibs, so the standard <stdio.h> can be linked directly. Background:
+#   docs/newlib_transition.md.
+#
+#   Why an absolute path: each case's run.sh sources the chipyard conda env and
+#   prepends the conda bin to PATH. That directory has no riscv32-unknown-elf-*,
+#   so relying on PATH would make results differ per case. Override with
+#   RISCV_TOOLCHAIN=<prefix> or RISCV_PREFIX=<tuple-> if needed.
+#   (Simulation and verification still run on the chipyard side - only the
+#    compiler changes here.)
+# dscloud
+RISCV_TOOLCHAIN ?= /share/opt/toolchain/gcc13.2_fastinterrupt
+# VWP / HPC (closed network)
+#RISCV_TOOLCHAIN ?= /user/rocket/opt/toolchain/gcc13.2_fastinterrupt
+RISCV_PREFIX    ?= $(RISCV_TOOLCHAIN)/bin/riscv32-unknown-elf-
+CC      = $(RISCV_PREFIX)gcc
+OBJDUMP = $(RISCV_PREFIX)objdump
+NM      = $(RISCV_PREFIX)nm
+SIZE    = $(RISCV_PREFIX)size
+
+ARCH ?= rv32imac_zicsr_zifencei
+ABI  ?= ilp32
+# extra defines for the firmware (optional)
+EXTRA_CFLAGS ?=
+
+src_dir    ?= ..
+bsp_dir     = $(src_dir)/Platform/Chipset/TinyRocket
+shim_dir    = $(bsp_dir)/hal_shim
+common_inc  = $(src_dir)/Platform/Common/Inc
+build_dir   = build
+
+TARGET ?= S5740
+F      ?= CLINT
+SF     ?= rtc
+verif_dir = $(src_dir)/verif/ip/$(TARGET)/$(F)/$(SF)
+TEST = $(F)_$(SF)
+
+# -- TRACK selection ---------------------------------------------
+#   TRACK=shim (default)      : hal_shim.c mock HAL (start.S)
+#   TRACK=baremetal           : rt-dev faithful (crt.S/mtvec.S/pISR_BASE,
+#                               syscalls.c/interrupt.c/util.c, rtdev_shim.c)
+# rt-dev track needs -DPREEMPTION (mtvec.S mret). FPU is OFF (rv32imac, no F).
+TRACK ?= shim
+
+rtdev_common = $(src_dir)/Platform/Common/Src
+
+# -- stdio implementation selection (USE_NEWLIB_STDIO) -----------
+#   0 : link the existing in-house Platform/Common/Src/printf.c.
+#   1 (current default) : use newlib's <stdio.h> printf -> printf.c is not
+#       linked.
+#
+#   =1 is not merely "add newlib" - three things come together
+#     (rationale and measurements in chapters 5-6 of docs/newlib_transition.md)
+#
+#     (1) --specs=nano.specs : the default newlib is too big. FREERTOS_preempt
+#         overshoots link.ld's 60K ram by 12,360 B. With nano it fits.
+#     (2) -u _printf_float   : nano omits the %f conversion code by default.
+#         This symbol must be pulled in explicitly for %f/%e/%g to work (handled
+#         in soft float without the F extension - rv32imac is preserved).
+#         This is a per-case opt-in (USE_PRINTF_FLOAT / TEST_PRINTF_FLOAT in
+#           test.mk). Enabling it globally would drag float conversion +
+#           __gdtoa + soft double into cases that never call printf at all,
+#           growing the image by ~20 KB
+#           (measured: CLINT_sw_interrupt 2,120 -> 26,516). Enable it only for
+#           cases that use %f.
+#     (3) newlib_glue.c      : libgloss's _sbrk/_fstat/... are the proxy-kernel
+#         ABI versions and issue an `ecall`. This DUT has no proxy kernel, so an
+#         M-mode ecall becomes mcause=11 -> trap_handler -> exit(CODE_FATAL).
+#         We define the same names ourselves to displace them, and provide only
+#         printf's minimum requirement (measured 232 B) as a fixed heap. This is
+#         not opening up dynamic malloc - beyond that, _sbrk returns -1.
+#         Additionally, set_log() in util.c calls setvbuf(stdout,_IONBF), which
+#           eliminates the 1 KB stdout FILE buffer malloc entirely.
+#
+#   printf.c was not deleted, and printf.h was kept - six files include it
+#   (port_glue.c, log.h, FREERTOS_preempt.c, UART_printf.c, CA_measure.c and
+#   printf.c itself). With USE_NEWLIB_STDIO=1, printf.h becomes a thin shim over
+#   <stdio.h>, so none of those six need touching either way.
+#
+#   USE_NEWLIB_STDIO=0 is byte-identical to the baseline (for regression
+#   comparison).
+USE_NEWLIB_STDIO ?= 1
+# Fixed heap for printf's minimum requirement (bytes). Measured high-water 232 + headroom.
+NEWLIB_HEAP_SIZE ?= 512
+ifeq ($(USE_NEWLIB_STDIO),1)
+  STDIO_SRC    = $(rtdev_common)/newlib_glue.c
+  STDIO_CFLAGS = -DUSE_NEWLIB_STDIO=1 -DNEWLIB_HEAP_SIZE=$(NEWLIB_HEAP_SIZE) \
+                 --specs=nano.specs
+else
+  STDIO_SRC     = $(rtdev_common)/printf.c
+  STDIO_CFLAGS  = -DUSE_NEWLIB_STDIO=0
+endif
+
+ifeq ($(TRACK),baremetal)
+  # rt-dev infra: crt.S + mtvec.S (bsp_dir/*.S), rtdev_shim (exit only),
+  #   syscalls.c/interrupt.c/util.c (Common/Src). NO hal_shim.c (conflicts).
+  ASM_SRC  = $(bsp_dir)/crt.S $(bsp_dir)/mtvec.S
+  BSP_SRC  =
+  SHIM_SRC = $(bsp_dir)/rtdev_shim/rtdev_shim.c
+  # uart.c: DUT-driven stdout (printf -> _write -> UART0). Existing cases are
+  #   unaffected as long as they simply do not call it.
+  # The printf implementation is $(STDIO_SRC) - empty by default
+  #   (USE_NEWLIB_STDIO=1), since newlib provides it.
+  RTDEV_SRC = $(rtdev_common)/syscalls.c $(rtdev_common)/interrupt.c $(rtdev_common)/util.c \
+              $(rtdev_common)/uart.c $(STDIO_SRC)
+  # test firmware: exclude .cc (host Vseq); Src/*.c only, but sw.c is here too
+  FW_SRC   = $(wildcard $(verif_dir)/Src/*.c)
+  TRACK_CFLAGS = -DPREEMPTION -include $(src_dir)/Platform/Chipset/S5740/Inc/S5740.h
+  # rt-dev headers first (util.h/interrupt.h), then S5740 (S5740.h addresses)
+  TRACK_INC = -I$(common_inc) -I$(src_dir)/Platform/Chipset/S5740/Inc
+else
+  # self-check track (v294): unchanged
+  ASM_SRC  = $(wildcard $(bsp_dir)/*.S)
+  BSP_SRC  = $(wildcard $(bsp_dir)/*.c)
+  SHIM_SRC = $(wildcard $(shim_dir)/*.c)
+  RTDEV_SRC =
+  FW_SRC   = $(wildcard $(verif_dir)/Src/*.c)
+  TRACK_CFLAGS =
+  TRACK_INC =
+endif
+
+# -- FreeRTOS (USE_FREERTOS=1) ------------------------------------
+#   Adds Middleware/FreeRTOS to the build. It only stacks on top of
+#   TRACK=baremetal (because it reuses the crt.S boot plus the uart.c/printf.c
+#   stdout path as is).
+#   Config: Middleware/FreeRTOS/config/FreeRTOSConfig.h
+#   Port:   the official GCC/RISC-V port + port_glue.c (mtvec switch/memset/hooks)
+#   With USE_FREERTOS=0 (the default) all the variables below stay empty, so
+#   existing cases are unaffected.
+USE_FREERTOS ?= 0
+rtos_dir    = $(src_dir)/Middleware/FreeRTOS
+rtos_kernel = $(rtos_dir)/kernel
+rtos_port   = $(rtos_dir)/port/RISC-V
+# The chip extension portASM.S looks up through the assembler include path (SiFive CLINT with MTIME)
+rtos_chipext = $(rtos_port)/chip_specific_extensions/RISCV_MTIME_CLINT_no_extensions
+
+ifeq ($(USE_FREERTOS),1)
+  ifneq ($(TRACK),baremetal)
+    $(error USE_FREERTOS=1 requires TRACK=baremetal)
+  endif
+  RTOS_SRC = $(rtos_kernel)/tasks.c $(rtos_kernel)/list.c \
+             $(rtos_kernel)/portable/MemMang/heap_4.c \
+             $(rtos_port)/port.c $(rtos_port)/port_glue.c
+  RTOS_ASM = $(rtos_port)/portASM.S
+  RTOS_INC = -I$(rtos_kernel)/include -I$(rtos_port) -I$(rtos_chipext) \
+             -I$(rtos_dir)/config
+  # port_glue.c defines memset/memcpy itself -> no builtin substitution
+  RTOS_CFLAGS = -DUSE_FREERTOS=1 -fno-builtin-memset -fno-builtin-memcpy \
+                -fno-builtin-memcmp -fno-builtin-strlen
+else
+  RTOS_SRC =
+  RTOS_ASM =
+  RTOS_INC =
+  RTOS_CFLAGS =
+endif
+
+# -- Benchmark (USE_BENCH=coremark | dhrystone) ------------------
+#   Adds Middleware/benchmark to the build. It only stacks on top of
+#   TRACK=baremetal (because it reuses the crt.S boot, link.ld and the
+#   verif_ca.h CA instrumentation as is).
+#   The benchmark bodies are upstream and unmodified; only the porting layer is
+#   written here.
+#     - CoreMark  : Middleware/benchmark/coremark/port/core_portme.{c,h}
+#     - Dhrystone : Middleware/benchmark/dhrystone/port/dhry_port.c
+#   With USE_BENCH=0 (the default) all the variables below stay empty, so
+#   existing cases are unaffected.
+#
+#   printf.c is replaced with bench_stdio.c
+#     Platform/Common/Src/printf.c sends output to UART0 (~43k cycles per
+#     character). A benchmark report is hundreds of characters, so over the UART
+#     printing would take longer than the benchmark itself, and those cycles
+#     would mix into mcycle and contaminate the measurement. Benchmark builds
+#     therefore swap in bench_stdio.c, which goes out over the HTIF
+#     (tohost/fromhost) console.
+#     Existing cases (USE_BENCH=0) keep using printf.c.
+USE_BENCH  ?= 0
+bench_dir   = $(src_dir)/Middleware/benchmark
+bench_common= $(bench_dir)/common
+# ITERATIONS: RTL (verilator) runs at a few thousand cycles/s, so keep the iteration count small.
+BENCH_ITERATIONS ?= 2
+
+ifneq ($(USE_BENCH),0)
+  ifneq ($(TRACK),baremetal)
+    $(error USE_BENCH requires TRACK=baremetal)
+  endif
+  BENCH_COMMON_SRC = $(bench_common)/bench_stdio.c $(bench_common)/bench_libc.c
+  BENCH_INC  = -I$(bench_common)
+  # bench_libc.c defines memcpy/memset/strcpy/strcmp itself -> no builtin
+  # substitution. (Substitution would call libgcc/newlib symbols, and neither is
+  # available for rv32, so the link would fail.)
+  BENCH_CFLAGS = -fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove \
+                 -fno-builtin-memcmp -fno-builtin-strlen -fno-builtin-strcpy \
+                 -fno-builtin-strcmp
+endif
+
+ifeq ($(USE_BENCH),coremark)
+  cm_dir   = $(bench_dir)/coremark
+  BENCH_SRC = $(BENCH_COMMON_SRC) \
+              $(cm_dir)/core_main.c $(cm_dir)/core_list_join.c \
+              $(cm_dir)/core_matrix.c $(cm_dir)/core_state.c \
+              $(cm_dir)/core_util.c \
+              $(cm_dir)/port/core_portme.c
+  BENCH_INC += -I$(cm_dir) -I$(cm_dir)/port
+  BENCH_CFLAGS += -DITERATIONS=$(BENCH_ITERATIONS) \
+                  -DFLAGS_STR="\"$(OPT) -march=$(ARCH) -mabi=$(ABI)\"" \
+                  -DPERFORMANCE_RUN=1
+  BENCH_PREBUILT =
+endif
+
+ifeq ($(USE_BENCH),dhrystone)
+  dh_dir   = $(bench_dir)/dhrystone
+  # The two upstream files are compiled separately, adjusted only via -D (the
+  # sources stay unmodified).
+  #  - dhrystone_main.c : -Dmain=dhry_main_entry
+  #      Renamed so a CA/DMIPS report can be appended after the original main().
+  #      The real main() lives in port/dhry_port.c.
+  #  - dhrystone.c      : -Ddebug_printf=dhry_debug_printf_stub
+  #      The riscv-tests original dhrystone.c defines debug_printf() as an empty
+  #      function, which kills Dhrystone's result-verification output ("Final
+  #      values of the variables ...") entirely. That output is the only
+  #      self-check that the benchmark ran correctly, so we want it back.
+  #      Displacing just the original definition under a different name makes
+  #      the call in dhrystone_main.c bind to the real debug_printf in
+  #      bench_stdio.c.
+  BENCH_PREBUILT = $(build_dir)/dhrystone_main.o $(build_dir)/dhrystone.o
+  BENCH_SRC = $(BENCH_COMMON_SRC) \
+              $(dh_dir)/port/dhry_port.c
+  BENCH_INC += -I$(dh_dir) -I$(dh_dir)/port
+endif
+
+ifneq ($(USE_BENCH),0)
+  # Drop the printf implementation and substitute bench_stdio.c (see the
+  # comment above). The rest (syscalls.c/interrupt.c/util.c/uart.c) is left
+  # alone.
+  #   With USE_NEWLIB_STDIO=1, what gets dropped here is newlib_glue.c. The
+  #   benchmarks define printf/puts/putchar/vprintf in bench_stdio.c and
+  #   memcpy/memset/... in bench_libc.c, so libc stdio is never pulled in at all
+  #   -> _sbrk is not needed either, and the benchmark images stay identical to
+  #   before.
+  RTDEV_SRC := $(filter-out $(STDIO_SRC),$(RTDEV_SRC))
+  # Since newlib_glue.c is gone, util.c must not call newlib_stdio_init()
+  # -> benchmark builds revert the stdio switch to 0. nano.specs is dropped too.
+  STDIO_CFLAGS := -DUSE_NEWLIB_STDIO=0
+endif
+
+# -- Shared HAL modules (opt-in) ---------------------------------
+#   Links Platform/Common/Src/<name>.c only into the tests that need it.
+#
+#   Why opt-in (rather than linking everything by default):
+#     This build uses -nostdlib and does not use --gc-sections. That means any
+#     .c placed in the link ends up in the image whole, even if never called.
+#     link.ld's ram is only 60K, and some cases are already large
+#     (CoreMark 14K / FreeRTOS 15K), so pulling in unused drivers by default
+#     would grow every case's image. Hence the explicit selection.
+#     (Once --gc-sections is adopted on the way to the SDK, this opt-in can go
+#      away - see "next steps" in chip_docs/verif/docs/baremetal.md)
+#
+#   Two ways to select (their union is used):
+#     1) put a test.mk in the test folder with  TEST_HAL_MODULES = timer sw
+#     2) pass a make argument                   HAL_MODULES="timer sw"
+#   Assembly modules (.S) are selected separately via TEST_HAL_ASM /
+#   HAL_ASM_MODULES.
+-include $(verif_dir)/test.mk
+HAL_MODULES     ?=
+HAL_ASM_MODULES ?=
+_HAL_MODS  = $(sort $(TEST_HAL_MODULES) $(HAL_MODULES))
+_HAL_AMODS = $(sort $(TEST_HAL_ASM) $(HAL_ASM_MODULES))
+
+# -- %f support (opt-in) -----------------------------------------
+#   newlib-nano's printf does not include the %f/%e/%g conversion code by
+#   default. The symbol must be pulled in explicitly with `-u _printf_float`.
+#   But that is a link-level decision: the moment it is enabled, float
+#   conversion + __gdtoa + soft double (__adddf3/__divdf3/...) all come in -
+#   measured at ~20 KB.
+#   There is no reason to pay that in cases that never call printf, so it is a
+#   per-case opt-in. Enabling it next to test.mk is the natural place, so it
+#   sits at the same point as the HAL module selection (i.e. after the test.mk
+#   include).
+#
+#   Two ways to enable:
+#     1) in the test folder's test.mk   TEST_PRINTF_FLOAT = 1
+#     2) as a make argument             USE_PRINTF_FLOAT=1
+#   Ignored when USE_NEWLIB_STDIO=0 (the in-house printf.c has no %f at all).
+USE_PRINTF_FLOAT ?= 0
+_PRINTF_FLOAT := $(filter-out 0,$(strip $(TEST_PRINTF_FLOAT)) $(strip $(USE_PRINTF_FLOAT)))
+ifeq ($(USE_NEWLIB_STDIO),1)
+  ifneq ($(_PRINTF_FLOAT),)
+    STDIO_LDFLAGS = -u _printf_float
+  endif
+endif
+HAL_SRC = $(addprefix $(rtdev_common)/,$(addsuffix .c,$(_HAL_MODS)))
+HAL_ASM = $(addprefix $(rtdev_common)/,$(addsuffix .S,$(_HAL_AMODS)))
+
+# -- Test folder wins (override) ---------------------------------
+#   This project's policy is "copy rt-dev tests in whole folders, unchanged".
+#   A copied test folder often brings its own driver (.c) along
+#   (e.g. CLINT/sw_interrupt/Src/sw.c). If the shared HAL has a file of the same
+#   name, the same symbols get defined twice and the link breaks.
+#
+#   Rule: if the test folder (verif/.../Src) has a file name that matches the
+#         shared HAL, the test's copy wins. The shared file is removed from the
+#         link list.
+#         The same goes for headers - the -I order in CFLAGS puts
+#         $(verif_dir)/Inc ahead of $(common_inc), so the test's Inc/*.h is
+#         picked up first.
+#   As a result, rt-dev tests build after a plain copy-paste with no edits.
+# Resolved immediately with := . RTDEV_SRC/HAL_SRC are actually filtered below,
+# so leaving these as recursive variables would make show-src recompute them
+# later and always display an empty list.
+_FW_NAMES  := $(notdir $(FW_SRC))
+_OVERRIDES := $(filter $(_FW_NAMES),$(notdir $(RTDEV_SRC) $(HAL_SRC)))
+ifneq ($(_OVERRIDES),)
+  $(info [hal] test overrides common: $(_OVERRIDES))
+endif
+RTDEV_SRC := $(filter-out $(addprefix $(rtdev_common)/,$(_OVERRIDES)),$(RTDEV_SRC))
+HAL_SRC   := $(filter-out $(addprefix $(rtdev_common)/,$(_OVERRIDES)),$(HAL_SRC))
+
+LDSCRIPT = $(bsp_dir)/link.ld
+
+# -- auto-extract UART address (version-independent; usually unneeded for mailbox-based co-sim, kept for consistency) --
+# dscloud
+CHIPYARD ?= $(HOME)/_project/chipyard
+# VWP / HPC (closed network)
+#CHIPYARD ?= /user/rocket/users/dongju2/_project/chipyard
+CONFIG   ?= RV32RocketConfig
+DTS = $(CHIPYARD)/sims/verilator/generated-src/chipyard.harness.TestHarness.$(CONFIG)/chipyard.harness.TestHarness.$(CONFIG).dts
+UART_ADDR := $(shell [ -f "$(DTS)" ] && grep -oE 'serial@[0-9a-f]+' "$(DTS)" 2>/dev/null | head -1 | sed 's/serial@//')
+ifneq ($(UART_ADDR),)
+  UART_DEF = -DUART_BASE_ADDR=0x$(UART_ADDR)
+else
+  UART_DEF =
+endif
+
+# OPT: defaults to -O2 (preserving existing behaviour). Switch to OPT=-Os if the 60K DTIM gets tight.
+OPT ?= -O2
+
+# v304-newlib: -nostdlib was dropped (newlib libc + libgcc are linked).
+#   -nostartfiles is kept -> crt0.o is not linked. crt.S still owns the boot.
+#   -ffreestanding is kept -> no special treatment of main and no implicit
+#   libcall assumptions.
+CFLAGS  = -march=$(ARCH) -mabi=$(ABI) $(OPT) -nostartfiles -ffreestanding -Wall \
+          -I$(bsp_dir) -I$(shim_dir) -I$(verif_dir)/Inc -I$(common_inc) \
+          $(TRACK_INC) $(TRACK_CFLAGS) $(STDIO_CFLAGS) $(RTOS_INC) $(RTOS_CFLAGS) \
+          $(BENCH_INC) $(BENCH_CFLAGS) \
+          $(UART_DEF) $(EXTRA_CFLAGS)
+LDFLAGS = -T $(LDSCRIPT) -nostartfiles -n $(STDIO_LDFLAGS)
+
+ELF = $(build_dir)/$(TEST).elf
+
+all: $(ELF)
+$(build_dir): ; mkdir -p $(build_dir)
+
+# Dhrystone only: compile the upstream files separately, renaming the original
+# main() to dhry_main_entry. The upstream sources are not touched (handled
+# purely with -D).
+$(build_dir)/dhrystone_main.o: $(bench_dir)/dhrystone/dhrystone_main.c | $(build_dir)
+	$(CC) $(CFLAGS) -Dmain=dhry_main_entry -c -o $@ $<
+
+$(build_dir)/dhrystone.o: $(bench_dir)/dhrystone/dhrystone.c | $(build_dir)
+	$(CC) $(CFLAGS) -Ddebug_printf=dhry_debug_printf_stub -c -o $@ $<
+
+$(ELF): $(ASM_SRC) $(RTOS_ASM) $(HAL_ASM) $(BSP_SRC) $(SHIM_SRC) $(RTDEV_SRC) $(HAL_SRC) $(RTOS_SRC) $(BENCH_SRC) $(BENCH_PREBUILT) $(FW_SRC) $(LDSCRIPT) | $(build_dir)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(ASM_SRC) $(RTOS_ASM) $(HAL_ASM) $(BSP_SRC) $(SHIM_SRC) \
+	      $(RTDEV_SRC) $(HAL_SRC) $(RTOS_SRC) $(BENCH_SRC) $(BENCH_PREBUILT) $(FW_SRC)
+	$(OBJDUMP) -d $@ > $(build_dir)/$(TEST).dump
+	@$(NM) $@ | grep -E " _start| tohost| fromhost" || true
+	@$(SIZE) $@ || true
+	@echo "built: $@"
+
+SIM_DIR  ?= $(CHIPYARD)/sims/verilator
+
+# -- backend run (generalized) --
+# Select the backend via the BACKEND variable. Each backend provides backend/<B>/run.sh or vp/<B>/run.sh.
+#   chipyard -> run-verilator below (verified path)
+#   rt-dev   -> backend/rt-dev/run.sh (company original engine; trigger_irq implemented -> co-sim capable)
+#   spike    -> vp/spike/run.sh (functional verification)
+#   spike-ca -> vp/spike/run.sh +mode=ca (CA, timing model)
+BACKEND  ?= chipyard
+run: $(ELF)
+	@if [ "$(BACKEND)" = "chipyard" ]; then \
+	  $(MAKE) -f $(firstword $(MAKEFILE_LIST)) run-verilator CONFIG=$(CONFIG); \
+	elif [ -x "$(src_dir)/vp/$(BACKEND)/run.sh" ]; then \
+	  "$(src_dir)/vp/$(BACKEND)/run.sh" "$(abspath $(ELF))" TEST=$(TEST); \
+	elif [ -x "$(src_dir)/verif/backend/$(BACKEND)/run.sh" ]; then \
+	  "$(src_dir)/verif/backend/$(BACKEND)/run.sh" "$(abspath $(ELF))" TEST=$(TEST); \
+	else \
+	  echo "no run.sh for BACKEND=$(BACKEND)"; exit 2; \
+	fi
+
+# chipyard-specific path (verified path - kept as-is)
+run-verilator: $(ELF)
+	$(MAKE) -C $(SIM_DIR) run-binary CONFIG=$(CONFIG) BINARY=$(abspath $(ELF))
+
+# Diagnostic target for eyeballing the final source list.
+# Use it to check whether the override actually took effect (i.e. whether the
+# shared .c was dropped).
+#   make -f Implementation/Makefile.VERIF src_dir=. F=CLINT SF=sw_interrupt TRACK=baremetal show-src
+show-src:
+	@echo "TEST        : $(TEST)"
+	@echo "TRACK       : $(TRACK)"
+	@echo "HAL modules : $(_HAL_MODS) $(addsuffix .S,$(_HAL_AMODS))"
+	@echo "overridden  : $(_OVERRIDES)"
+	@echo "ASM_SRC     : $(ASM_SRC) $(HAL_ASM) $(RTOS_ASM)"
+	@echo "COMMON_SRC  : $(RTDEV_SRC)"
+	@echo "HAL_SRC     : $(HAL_SRC)"
+	@echo "FW_SRC      : $(FW_SRC)"
+
+clean: ; rm -rf $(build_dir)
+.PHONY: all run run-verilator clean show-src

@@ -1,0 +1,46 @@
+/* start.S - TinyRocket bring-up (chip_platform_v2, stage 1)
+ *
+ * boot -> set up stack -> clear .bss -> mtvec (unexpected trap=FAIL) -> call main()
+ * -> pass main return value (a0) to exit() (= tohost decision, hal_shim.c).
+ *
+ * Target: chipyard TinyRocketConfig (RV32IMAC, TCM @ 0x80000000).
+ * Exit/decision use the riscv-tests convention (tohost). exit() is in hal_shim.c.
+ */
+    .section .text.init,"ax",@progbits
+    .globl _start
+    .align 2
+_start:
+    /* global pointer (optional) */
+    .option push
+    .option norelax
+    la      gp, __global_pointer$
+    .option pop
+
+    /* stack */
+    la      sp, __stack_top
+
+    /* .bss = 0 */
+    la      t0, __bss_start
+    la      t1, __bss_end
+1:  bgeu    t0, t1, 2f
+    sw      zero, 0(t0)
+    addi    t0, t0, 4
+    j       1b
+2:
+
+    /* unexpected exceptions -> FAIL (avoid hang) */
+    la      t0, trap_entry
+    csrw    mtvec, t0
+
+    /* main() -> exit(ret) */
+    call    main
+    call    exit              /* a0 = main return value (CODE_SUCCESS=0 means PASS) */
+
+hang:
+    j       hang
+
+    .align 2
+    .globl trap_entry
+trap_entry:
+    li      a0, 1             /* any non-success -> tohost FAIL */
+    call    exit

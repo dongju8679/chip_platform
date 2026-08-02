@@ -1,0 +1,5 @@
+rt-dev backend adapter
+engine: company original Verification_SDK engine (Verilator-based)
+seam:   verif_rtdev.h (verif_primitives_t implementation)
+status: adapter skeleton (actual rt-dev API wiring in the company environment)
+capabilities: master_*, trigger_irq(implemented), tick, get_cycle(CA)

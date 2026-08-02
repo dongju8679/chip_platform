@@ -1,0 +1,28 @@
+# backends/chipyard/backend.yaml
+# -------------------------------------------------------------
+# Characteristics of one backend (execution engine). CI reads this to iterate appropriately.
+# Adapter code path is reference only (the directory owns it).
+# -------------------------------------------------------------
+
+name:     chipyard
+type:     rtl                 # rtl | iss | tlm
+accuracy: cycle-accurate      # cycle-accurate | functional | transaction
+host_comm: tsi                # tsi | dpi | tlm - host<->DUT communication method
+
+# -- adapter (verif_primitives_t implementation) --
+adapter:  adapter/verif_host.h     # class verif_tsi_t
+
+# -- version/compat (move the current VERSION file here) --
+version:
+  chipyard:    "1.10.0"
+  rocket_chip: 47f7b7144727f0340d511d35b9f6c7a91b2a276f
+  testchipip:  128ccb09f0122651cadff4451cf30cf591636a70
+
+# -- capabilities (referenced by CI/bench) --
+capabilities:
+  cycle_count: true           # can measure cycle/IPC (benchmark MODE)
+  trigger_irq: false          # not implemented (needs HarnessBinder/DPI)
+  waveform:    true           # generates VCD
+
+# -- application method --
+apply: apply_backend.sh        # inline injection into the chipyard tree

@@ -1,0 +1,48 @@
+# targets/S5740/target.yaml
+# -------------------------------------------------------------
+# Metadata for one lineup (TARGET) + valid backend declarations.
+# Paths, test lists, and test addresses (TEST_ADDR) are not defined here.
+#   paths     -> directory convention (targets/S5740/suite/<F>/<SF>/)
+#   test list -> suite/S5740.list (SDK original)
+#   test addr -> suite/<F>/<SF>/Inc/*.h (SDK original, unmodified)
+# -------------------------------------------------------------
+
+name: S5740
+description: RF MCU verification target (TinyRocket core)
+
+# -- core/ISA meta (move current Makefile hardcoding here) --
+core:  TinyRocket          # RV32IMAC. Can later be replaced with S5740 RTL
+isa:   rv32imac_zicsr_zifencei
+abi:   ilp32
+xlen:  32
+
+# -- build meta --
+toolchain_prefix: riscv64-unknown-elf-
+
+# -- DUT configuration --
+dut:
+  default_config: RV32CosimConfig
+  configs:        [RV32CosimConfig]      # grows later
+  # platform/DUT-side addresses only. The TEST_ADDR used by tests is not here (=.h owns it).
+  # below is "record" level (reference). Promotion to generation (addrmap.h) is later.
+  platform_addr:
+    rtc_mock: 0x2B00         # hal_shim RTC mock (platform side)
+
+# -- valid backends (info only yaml can express) --
+# Which backends can verify this TARGET.
+# Each backend overrides TEST/BREAK addresses per the DUT memory map.
+supported_backends:
+  - name: chipyard
+    verified: true
+    # chipyard DRAM @0x80000000, so override instead of the SDK value (0x50000)
+    addr_override: { test: 0x80010004, break: 0x80010000 }
+  - name: rt-dev
+    verified: false           # company original engine. Adapter backend/rt-dev/ is ready
+    adapter: backend/rt-dev/verif_rtdev.h   # trigger_irq implemented -> co-sim capable
+  - name: sv
+    verified: false           # SystemVerilog (DPI adapter)
+  # - name: pulp              # unsupported example - not possible if not listed
+
+# -- memory map reference --
+memory:
+  dram_base: 0x80000000       # chipyard baseline (may differ per backend)

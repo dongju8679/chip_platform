@@ -1,0 +1,3 @@
+# PLACEHOLDER - paste the original Implementation/Makefile.S5740, with:
+#   VERSION_OF_TARGET = ?= EVT0   ->   VERSION_OF_TARGET ?= EVT0   (remove duplicate = ?=)
+#   CRLF -> LF.

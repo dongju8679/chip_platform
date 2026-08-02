@@ -1,0 +1,51 @@
+# scr_env.example - machine-local paths for chip_platform
+#
+# The built-in defaults target the dscloud reference environment. On any other
+# machine, copy this file to ~/.scr_env and edit the paths:
+#
+#   cp scr_env.example ~/.scr_env
+#   $EDITOR ~/.scr_env
+#
+# setup_custom_riscv.sh and ci/run_regress.sh source it automatically when it
+# exists. Precedence:
+#
+#   command-line argument  >  environment  >  ~/.scr_env  >  built-in default
+#
+# ':=' assigns only when the variable is empty, so anything already exported or
+# passed on the command line still wins.
+
+# ---- spike engine prefix -------------------------------------------------
+# Must contain include/riscv, include/fesvr, lib/libriscv.*, lib/libfesvr.*.
+# include/riscv is what switches vp/spike/build.sh into SPIKE_NATIVE mode; if it
+# is missing the build silently produces no simulator at all.
+: "${SPIKE_INSTALL:=$HOME/opt/riscv/spike/chipyard-v1.13-9c190a07}"
+
+# ---- rv32 firmware compiler ----------------------------------------------
+# Needs bin/riscv32-unknown-elf-gcc with an rv32imac_zicsr_zifencei/ilp32
+# multilib including newlib. Check with:
+#   $RISCV_TOOLCHAIN/bin/riscv32-unknown-elf-gcc -print-multi-lib
+# A single '.;' line means no multilib was built and the link will fail.
+: "${RISCV_TOOLCHAIN:=$HOME/opt/riscv/toolchain/rv32gcc-13.2.0-fast_interrupt}"
+
+# ---- combined prefix -----------------------------------------------------
+# Output of setup_custom_riscv.sh, and the value of RISCV at run time.
+: "${OUT_PREFIX:=$HOME/opt/riscv/merged/custom-verif}"
+: "${RISCV:=$OUT_PREFIX}"
+
+# ---- riscv64 gcc (safety guard only) -------------------------------------
+# ci/run_regress.sh checks that $RISCV/bin/riscv64-unknown-elf-gcc exists.
+# It is only symlinked, never executed. A chipyard conda env supplies it.
+: "${GCC64_PREFIX:=$HOME/chipyard/.conda-env/riscv-tools}"
+
+# ---- chipyard ------------------------------------------------------------
+# A writable chipyard tree with a built simulator
+# are rejected by the guards in ci/run_regress.sh and every case run.sh.
+: "${CHIPYARD:=$HOME/chipyard-verif}"
+: "${CONFIG:=RV32RocketConfig}"
+
+# ---- simulator flavour ---------------------------------------------------
+# sims/verilator on dscloud; sims/xcelium on the closed VWP/HPC network.
+: "${SIM_DIR:=sims/verilator}"
+
+export SPIKE_INSTALL RISCV_TOOLCHAIN OUT_PREFIX RISCV GCC64_PREFIX
+export CHIPYARD CONFIG SIM_DIR

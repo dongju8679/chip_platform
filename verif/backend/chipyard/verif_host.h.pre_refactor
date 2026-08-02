@@ -1,0 +1,383 @@
+// verif_host.h - chipyard backend adapter (chipyard impl of verif_primitives_t)
+//
+// Implements the framework seam (verif_primitives.h) on top of chipyard testchip_tsi_t (TSI).
+//   master_write/read -> write_chunk/read_chunk
+//   tick              -> approx no-op (read_chunk in idle() advances the target)
+//   trigger_irq       -> not implemented on chipyard (stage 3). Needs HarnessBinder/DPI.
+//
+// Built in the chipyard tree (testchipip csrc). SimTSI.cc creates verif_tsi_t on +verif.
+// Build pitfalls/application are handled by backend/chipyard/apply_backend.sh.
+#ifndef VERIF_HOST_H
+#define VERIF_HOST_H
+
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include "testchip_tsi.h"
+#include "testchip_external_interrupts.h"
+
+// -- DUT memory-map dependency: chipyard RV32RocketConfig has DRAM @0x80000000 --
+//   The SDK values (0x50000/0x51000) are S5740 RTL addresses, not reachable in chipyard DRAM.
+//   So the chipyard backend overrides with DRAM-region addresses (BP number protocol is common to the seam).
+#define VERIF_TEST_ADDR   0x80010004u
+#define VERIF_BREAK_ADDR  0x80010000u
+// CA: host-visible address where the DUT mirrors mcycle (cycle-accurate cycle counter).
+//   DUT side = Platform/Common/Inc/verif_ca.h :: verif_ca_mark_cycle() (method 1, no DPI).
+//   * moved 0x80010008/0x0C -> 0x80010040/0x44 : 0x80010008 is I2SR_int_muldiv's
+//     BREAK_ADDR (exit flag). A mirror the host polls must not alias another test's flag.
+//   Keep in sync with Platform/Common/Inc/verif_ca.h (VERIF_CA_*_ADDR).
+#define VERIF_CYCLE_LO_ADDR 0x80010040u
+#define VERIF_CYCLE_HI_ADDR 0x80010044u
+#define VERIF_INSTR_LO_ADDR 0x80010048u
+#define VERIF_INSTR_HI_ADDR 0x8001004Cu
+// CA result table written by the DUT (CA_measure). [0]=magic [1]=count, entries from +16.
+#define VERIF_CA_TABLE_ADDR 0x80010100u
+#define VERIF_CA_MAGIC      0xCA5EC0DEu
+#define VERIF_CA_ENTRY_SZ   32u
+// co-sim: host->DUT interrupt injection mailbox (cooperative IRQ model without DPI).
+//   The DUT IRQ polling routine reads this address and raises the corresponding IRQ.
+#define VERIF_IRQ_INJECT_ADDR 0x80010010u
+#include "verif_primitives.h"   // seam (via -I from VERIF/include). BP_* numbers are common.
+#include <cstdlib>
+#include <ctime>
+#include <vector>               // CA_measure result table readout
+
+// -- rt-dev Vseq wiring --
+// g_verif is what S5740_mcu_tests.h's free functions forward to; run_vseq() sets it.
+// Including the Vseq .cc here is what lets rt-dev test files stay byte-identical:
+// they call master_write()/tick()/... as free functions, exactly as on rt-dev.
+#include "S5740_mcu_tests.h"
+verif_primitives_t* g_verif = nullptr;
+
+#define VERIF_DUT_DBG_ADDR (0x80010020u)   // DUT progress marker (DBG() in the .c)
+#define VERIF_BP_TIMEOUT   (2000000L)      // host_wait_bp bound (ticks) before reporting
+
+#include "I2SR_int_muldiv.cc"              // rt-dev original Vseq (free functions)
+
+
+// verif_tsi_t = chipyard adapter. testchip_tsi_t (execution engine) + verif_primitives_t (interface).
+class verif_tsi_t : public testchip_tsi_t, public verif_primitives_t {
+public:
+  verif_tsi_t(int argc, char** argv) : testchip_tsi_t(argc, argv, true) {
+    ran = false;
+    fprintf(stderr, "[verif_tsi] ACTIVE (chipyard backend)\n");
+    for (int i = 0; i < argc; i++) {
+      std::string a = argv[i];
+      if (a.rfind("+verif=", 0) == 0) test = a.substr(7);
+    }
+  }
+
+  // -- seam implementation (verif_primitives_t) --
+  bool master_write(uint32_t addr, uint32_t data) override {
+    write_chunk((addr_t)addr, sizeof(uint32_t), &data);
+    return true;
+  }
+  bool master_read(uint32_t addr, uint32_t& data) override {
+    read_chunk((addr_t)addr, sizeof(uint32_t), &data);
+    return true;
+  }
+  void trigger_irq(uint32_t mask) override {
+      sim_ext_intr_trigger(0, mask);  
+  }
+  void todo_change(uint32_t mask) {
+    // chipyard interrupt injection (DRAM mirror mailbox method - no DPI).
+    //   Uses a cooperative model (soft-IRQ) where the DUT polls IRQ_INJECT_ADDR.
+    //   When the host writes a mask here, the DUT polling routine raises the corresponding IRQ.
+    //   (Real HW interrupts need HarnessBinder/DPI, but this cooperative model is
+    //    enough for co-sim - can measure PLIC routing/priority/latency function and cycles.)
+    master_write(VERIF_IRQ_INJECT_ADDR, mask);
+    // Explicitly give the DUT(target) time to poll/handle the ISR after IRQ injection.
+    // (Advance the target with master_read rather than relying on fprintf I/O yield.
+    //  read_chunk advances the target when called, so repeat enough for the DUT to
+    //  receive the IRQ, run the ISR, and set BP to END. 200 iterations is a measured PASS value.)
+    uint32_t dummy;
+    for (int i = 0; i < 200; i++) master_read(VERIF_IRQ_INJECT_ADDR, dummy);
+  }
+  void tick(int n) override {
+    // fesvr(tsi_t) is coroutine-based: switch_to_target() yields to the target context,
+    // which runs until the next tsi_tick() DPI call from SimTSI.v - i.e. exactly 1 clock.
+    // So tick(n) advances n clocks, equivalent to rt-dev's emulator tick(n).
+    for (int i = 0; i < n; i++) switch_to_target();
+  }
+  // -- host BP helper override --
+  // The verif_primitives_t default calls tick(1) inside host_wait_bp, but this backend's
+  // tick is a no-op, so the DUT(target) does not advance and it waits forever (timeout).
+  // On the chipyard backend the target advances when master_read(=read_chunk) is called,
+  // so override to repeat master_read without tick. (Form verified PASS in diagnostics)
+  void host_set_bp(uint32_t bp) override {
+    master_write(VERIF_BREAK_ADDR, bp);
+  }
+  bool host_wait_bp(uint32_t bp) override {
+    uint32_t v = 0;
+    // Bounded wait: a hang here means the DUT never reached the expected step.
+    // On timeout, report what the DUT actually left behind so the failure is diagnosable
+    // instead of an infinite spin.
+    for (long n = 0; n < VERIF_BP_TIMEOUT; n++) {
+      if (!master_read(VERIF_BREAK_ADDR, v)) return false;
+      if (v == bp) return true;
+      tick(1);
+    }
+    uint32_t dbg = 0, brk = 0;
+    master_read(VERIF_DUT_DBG_ADDR, dbg);
+    master_read(BREAK_ADDR, brk);
+    fprintf(stderr,
+            "[verif] TIMEOUT waiting bp=%u : bp_addr(0x%08x)=%u  dut_dbg(0x%08x)=%u  exitflag(0x%08x)=%u\n",
+            bp, VERIF_BREAK_ADDR, v, VERIF_DUT_DBG_ADDR, dbg, BREAK_ADDR, brk);
+    fprintf(stderr, "[verif]   dut_dbg meaning: 1=main 2=I2SR_EN 3=clint 4=plic_thr 5=reg_ext "
+                    "6=reg_hnd 7=mtvec/mie 8=wait_bp1 9=set_bp2 10=loop_in 11=wait_bp3 12=cnt_ok\n");
+    return false;
+  }
+  bool host_check_bp(uint32_t addr, uint32_t expect) override {
+    uint32_t v;
+    if (!master_read(addr, v)) return false;
+    return v == expect;
+  }
+
+  // -- CA extension --
+  // chipyard is RTL/Verilator = cycle-accurate. supports_ca()=true.
+  //   get_cycle(): read the DUT mcycle mirror (VERIF_CYCLE_LO/HI_ADDR).
+  //     Assumes the DUT-side hal_shim updates mcycle at that address (no DPI).
+  uint64_t get_cycle() override {
+    uint32_t lo = 0, hi = 0;
+    master_read(VERIF_CYCLE_LO_ADDR, lo);
+    master_read(VERIF_CYCLE_HI_ADDR, hi);
+    return ((uint64_t)hi << 32) | lo;
+  }
+  bool supports_ca() override { return true; }    // chipyard supports CA
+
+  // Companion to get_cycle(): committed-instruction count (minstret) mirror.
+  // Cycles alone don't prove anything; CPI = dcycle/dinstret is what shows the stalls.
+  uint64_t get_instret() {
+    uint32_t lo = 0, hi = 0;
+    master_read(VERIF_INSTR_LO_ADDR, lo);
+    master_read(VERIF_INSTR_HI_ADDR, hi);
+    return ((uint64_t)hi << 32) | lo;
+  }
+
+  // -- chipyard host context entry point --
+  void idle() override {
+    if (ran) { testchip_tsi_t::idle(); return; }
+    ran = true;
+    run_vseq();
+  }
+
+private:
+  bool ran;
+  std::string test;
+
+  void run_vseq() {
+    // Test dispatch. With real Vseq integration, per-test sequences are called here.
+    if (test == "CLINT_rtc" || test.empty()) return;   // self-check: host no-op
+
+    if (test == "CLINT_sw_interrupt") {
+      // rt-dev sw_interrupt host Vseq: fire SW IRQ via real CLINT MSIP, poll via read_chunk.
+      const uint32_t TEST_ADDR_ = 0x80011000u;   // DUT TEST counter (mailbox BUF)
+      uint32_t success[5] = {1,2,3,4,5};
+      bool pass = true;
+      for (int bp_num = 0; bp_num < 5; bp_num++) {
+        if (!master_write(0x02000000u, 1)) { pass=false; break; }  // CLINT MSIP=1 (real SW IRQ)
+        host_set_bp(BP_TEST_begin);                                 // BP=begin
+        if (!host_wait_bp(BP_TEST_end)) { pass=false; break; }       // wait DUT END (read_chunk)
+        if (!host_check_bp(TEST_ADDR_, success[bp_num])) { pass=false; break; }
+      }
+      uint32_t bp=0, cnt=0;
+      master_read(VERIF_BREAK_ADDR, bp);
+      master_read(TEST_ADDR_, cnt);
+      fprintf(stderr, "[verif] CLINT_sw_interrupt co-sim %s : BP=0x%x COUNT=0x%x\n",
+              pass?"PASS":"FAIL", bp, cnt);
+      return;
+    }
+    if (test == "CLINT_timer_interrupt") {
+      const uint32_t TEST_ADDR_ = 0x80011000u;
+      const int TMAX = 5;
+      uint32_t success_condition = 1;
+      bool pass = true;
+      for (int bp_num = 0; bp_num < TMAX; bp_num++) {
+        uint32_t vv=0; for(int w=0;w<50000;w++){ master_read(VERIF_BREAK_ADDR,vv); if(vv==BP_TEST_init) break; tick(1);}
+        host_set_bp(BP_TEST_begin);
+        tick(7000);
+        if (!host_wait_bp(BP_TEST_end)) { pass=false; break; }
+        if (!host_check_bp(TEST_ADDR_, success_condition)) { pass=false; break; }
+        success_condition++;
+      }
+      uint32_t bp=0, cnt=0;
+      master_read(VERIF_BREAK_ADDR, bp);
+      master_read(TEST_ADDR_, cnt);
+      fprintf(stderr, "[verif] CLINT_timer_interrupt co-sim %s : BP=0x%x COUNT=0x%x\n",
+              pass?"PASS":"FAIL", bp, cnt);
+      return;
+    }
+    if (test == "DEMO_handshake") {
+      fprintf(stderr, "[verif] DEMO_handshake: waiting bp=%u\n", BP_TEST_begin);
+      if (!host_wait_bp(BP_TEST_begin)) { fprintf(stderr,"[verif] FAIL wait\n"); return; }
+      uint32_t got = 0; master_read(VERIF_TEST_ADDR, got);
+      bool ok = (got == 0xABCDu);
+      fprintf(stderr, "[verif] DEMO_handshake co-sim %s (got 0x%X)\n", ok?"PASS":"FAIL", got);
+      master_write(VERIF_BREAK_ADDR, BP_TEST_end);   // release
+      return;
+    }
+
+    if (test == "PLIC_enable") {
+      // trigger_irq each PLIC line one by one -> DUT increments g_count in ISR -> host_check.
+      //   reset BP to BEGIN(2) per line, inject IRQ -> wait until DUT sets END(3).
+      const uint32_t PLIC_TEST_ADDR_ = 0x80010004u;   // DUT result address
+      const int MAX_PLIC = 8;                          // matches MAX_PLIC_NUMBER in PLIC_enable.h
+      fprintf(stderr, "[verif] PLIC_enable: start (MAX_PLIC=%d)\n", MAX_PLIC);
+      uint32_t success_condition = 1;
+      bool pass = true;
+      for (int bp_num = 0; bp_num < MAX_PLIC; bp_num++) {
+        uint32_t input = (1u << bp_num);
+        host_set_bp(BP_TEST_begin);                    // BP=2 (clear leftover END)
+        trigger_irq(input);                            // inject IRQ
+        if (!host_wait_bp(BP_TEST_end)) { pass=false; break; }   // wait for DUT END
+        if (!host_check_bp(PLIC_TEST_ADDR_, success_condition)) { pass=false; break; }
+        success_condition++;
+      }
+      fprintf(stderr, "[verif] PLIC_enable co-sim %s\n", pass?"PASS":"FAIL");
+      master_write(VERIF_BREAK_ADDR, BP_TEST_end);
+      return;
+    }
+
+    if (test == "PLIC_latency") {
+      // CA measurement: trigger_irq -> DUT ISR writes PMU latency to RESULT_ADDR.
+      const uint32_t PLIC_LAT_RESULT_ADDR_ = 0x80010004u;
+      const int PLIC_IRQ_ID_ = 3;
+      if (!host_wait_bp(BP_TEST_begin)) return;        // wait for DUT ready
+      trigger_irq(1u << PLIC_IRQ_ID_);                 // inject IRQ
+      if (!host_wait_bp(BP_TEST_end)) { master_write(VERIF_BREAK_ADDR, BP_TEST_end); return; }
+      uint32_t lat = 0; master_read(PLIC_LAT_RESULT_ADDR_, lat);
+      bool ok = (lat != 0);
+      fprintf(stderr, "[verif] PLIC_latency co-sim %s (latency=%u cycles)\n", ok?"PASS":"FAIL", lat);
+      master_write(VERIF_BREAK_ADDR, BP_TEST_end);
+      return;
+    }
+
+    if (test == "CA_measure") {
+      // -- execution-driven cycle-accurate measurement readout --
+      // The DUT (verif/ip/S5740/CA/measure) times reproducible code blocks with
+      // mcycle/minstret and leaves a table at VERIF_CA_TABLE_ADDR. The host only
+      // reads it out - no UART (a UART char costs tens of seconds of wall clock).
+      //
+      // Why this needs an execution-driven (RTL) backend: mcycle counts core
+      // clocks, so it includes load-use interlocks, taken-branch bubbles, multi-
+      // cycle mul/div and cache misses. A commit log only records retired
+      // instructions (= minstret), so it can never produce the cycle column.
+      fprintf(stderr, "[verif] CA_measure: waiting for DUT (bp=%u)\n", BP_TEST_end);
+      if (!host_wait_bp(BP_TEST_end)) {
+        fprintf(stderr, "[verif] CA_measure co-sim FAIL (DUT never reached BP_TEST_end)\n");
+        return;
+      }
+      // get_cycle()/get_instret(): value of the DUT mcycle mirror at the moment
+      // the DUT last called verif_ca_mark_cycle() (end of the measurement run).
+      uint64_t cyc_end = get_cycle(), ins_end = get_instret();
+
+      uint32_t magic = 0, count = 0;
+      master_read(VERIF_CA_TABLE_ADDR + 0, magic);
+      master_read(VERIF_CA_TABLE_ADDR + 4, count);
+      if (magic != VERIF_CA_MAGIC || count == 0 || count > 24) {
+        fprintf(stderr, "[verif] CA_measure co-sim FAIL (magic=0x%08x count=%u)\n", magic, count);
+        return;
+      }
+
+      // Read the whole table first, then report. Two views are printed:
+      //   RAW  = exactly what mcycle/minstret said across the block
+      //   NET  = RAW minus the OVERHEAD block (empty block: 4x csrr + indirect call).
+      // NET is what you compare between blocks; RAW is what is actually measured.
+      // NOTE the NET CPI of a pure-ALU block lands slightly under 1.0. That is not
+      // a sub-1-CPI core (single-issue in-order can't do that) - the OVERHEAD block's
+      // csrr instructions are themselves multi-cycle (see CSRRD, ~2.9 cyc each), so
+      // subtracting it over-corrects by a few percent. The overhead-free numbers are
+      // the CONTROLLED PAIRS printed below, which are differences of two blocks that
+      // were measured with the exact same instrumentation.
+      struct ca_row { char name[9]; uint32_t cyc, ins, iter, ncyc, nins; };
+      std::vector<ca_row> rows;
+      uint32_t ov_cyc = 0, ov_ins = 0;
+      fprintf(stderr,
+        "[verif] ---- CA_measure : execution-driven cycle-accurate (RV32RocketConfig) ----\n");
+      fprintf(stderr,
+        "[verif] %-9s %9s %9s %9s %9s %8s %10s\n",
+        "block", "cyc_raw", "ins_raw", "cyc_net", "ins_net", "CPI", "cyc/iter");
+      for (uint32_t i = 0; i < count; i++) {
+        uint32_t base = VERIF_CA_TABLE_ADDR + 16 + i * VERIF_CA_ENTRY_SZ;
+        uint32_t w0 = 0, w1 = 0, cyc = 0, ins = 0, iter = 0, dummy = 0;
+        master_read(base + 0,  w0);
+        master_read(base + 4,  w1);
+        master_read(base + 8,  cyc);
+        master_read(base + 12, dummy);           // cyc_hi (0 in this range)
+        master_read(base + 16, ins);
+        master_read(base + 20, dummy);           // ins_hi
+        master_read(base + 24, iter);
+        ca_row r;
+        for (int b = 0; b < 4; b++) r.name[b]     = (char)((w0 >> (8 * b)) & 0xFF);
+        for (int b = 0; b < 4; b++) r.name[4 + b] = (char)((w1 >> (8 * b)) & 0xFF);
+        r.name[8] = '\0';
+        r.cyc = cyc; r.ins = ins; r.iter = iter;
+
+        if (i == 0) { ov_cyc = cyc; ov_ins = ins; }   // first entry is OVERHEAD
+        r.ncyc = (cyc > ov_cyc) ? (cyc - ov_cyc) : 0;
+        r.nins = (ins > ov_ins) ? (ins - ov_ins) : 0;
+        rows.push_back(r);
+
+        if (i == 0)
+          fprintf(stderr, "[verif] %-9s %9u %9u %9s %9s %8s %10s  (calibration)\n",
+                  r.name, cyc, ins, "-", "-", "-", "-");
+        else
+          fprintf(stderr, "[verif] %-9s %9u %9u %9u %9u %8.3f %10.2f\n",
+                  r.name, cyc, ins, r.ncyc, r.nins,
+                  r.nins ? (double)r.ncyc / (double)r.nins : 0.0,
+                  r.iter ? (double)r.ncyc / (double)r.iter : 0.0);
+      }
+      fprintf(stderr, "[verif] ------------------------------------------------------------\n");
+
+      // -- controlled pairs: the actual "commit-log can't see this" evidence --
+      // Each pair runs the SAME instruction sequence with the SAME instrumentation.
+      // Their instruction counts are equal (or within the loop prologue), so a commit
+      // log cannot tell them apart. The cycle difference is the stall, isolated.
+      auto find_row = [&](const char* n) -> const ca_row* {
+        for (size_t k = 0; k < rows.size(); k++)
+          if (std::string(rows[k].name) == n) return &rows[k];
+        return nullptr;
+      };
+      struct { const char* a; const char* b; uint32_t n; const char* what; } pairs[] = {
+        {"LDUSE",   "LDINDEP", 256, "load-use interlock   (per lw whose result is used next)"},
+        {"BRTAKEN", "BRNTAKN", 256, "taken-branch bubble  (per taken branch)"},
+        {"DMISS",   "DHIT",    512, "cache miss           (per L1+L2-missing lw)"},
+      };
+      fprintf(stderr, "[verif] CONTROLLED PAIRS (same instructions, cycle delta = pure stall)\n");
+      fprintf(stderr, "[verif] %-9s %-9s %8s %8s %9s  %s\n",
+              "block_A", "block_B", "dInstr", "dCycle", "cyc/event", "isolates");
+      for (auto& p : pairs) {
+        const ca_row* A = find_row(p.a); const ca_row* B = find_row(p.b);
+        if (!A || !B) continue;
+        long dcyc = (long)A->ncyc - (long)B->ncyc;
+        long dins = (long)A->nins - (long)B->nins;
+        fprintf(stderr, "[verif] %-9s %-9s %8ld %8ld %9.2f  %s\n",
+                p.a, p.b, dins, dcyc, (double)dcyc / (double)p.n, p.what);
+      }
+      fprintf(stderr, "[verif] ------------------------------------------------------------\n");
+      uint32_t cyc0 = 0, ins0 = 0;
+      master_read(VERIF_CA_TABLE_ADDR + 8,  cyc0);
+      master_read(VERIF_CA_TABLE_ADDR + 12, ins0);
+      fprintf(stderr, "[verif] host get_cycle()  = %llu  (DUT mcycle mirror @0x%08x)\n",
+              (unsigned long long)cyc_end, VERIF_CYCLE_LO_ADDR);
+      fprintf(stderr, "[verif] host get_instret()= %llu  (DUT minstret mirror @0x%08x)\n",
+              (unsigned long long)ins_end, VERIF_INSTR_LO_ADDR);
+      fprintf(stderr, "[verif] whole-run via mirror: %llu cycles / %llu instr (CPI %.3f)\n",
+              (unsigned long long)(cyc_end - cyc0),
+              (unsigned long long)(ins_end - ins0),
+              (ins_end > ins0) ? (double)(cyc_end - cyc0) / (double)(ins_end - ins0) : 0.0);
+      fprintf(stderr, "[verif] supports_ca()=%d\n", (int)supports_ca());
+      fprintf(stderr, "[verif] CA_measure co-sim PASS (%u blocks)\n", count);
+      return;
+    }
+
+    if (test == "I2SR_int_muldiv") {
+      g_verif = this;                       // rt-dev Vseq free functions forward here
+      bool ok = ::I2SR_int_muldiv();        // verif/ip/S5740/I2SR/int_muldiv/Vseq/*.cc
+      fprintf(stderr, "[verif] I2SR_int_muldiv co-sim %s\n", ok ? "PASS" : "FAIL");
+      return;
+    }
+  }
+};
+
+#endif // VERIF_HOST_H

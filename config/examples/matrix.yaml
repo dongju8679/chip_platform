@@ -1,0 +1,43 @@
+# platform/matrix.yaml
+# -------------------------------------------------------------
+# List of combinations for CI to iterate. Single source of "what to run".
+# References target.yaml (valid combos) and suite/S5740.list (tests).
+# Does not duplicate paths/test definitions, lists only "combinations".
+# -------------------------------------------------------------
+
+runs:
+  # currently proven combination (self-check track)
+  - target:  S5740
+    backend: chipyard
+    config:  RV32CosimConfig
+    tests:   [CLINT/rtc]        # FEATURE/SUB_FEATURE (exists in S5740.list)
+    expect:  PASS
+
+  - target:  S5740
+    backend: chipyard
+    config:  RV32CosimConfig
+    tests:   [DEMO/handshake]
+    expect:  PASS
+
+  # future: host-stimulus tests with a backend that supports trigger_irq
+  - target:  S5740
+    backend: rt-dev              # trigger_irq implemented
+    config:  RV32CosimConfig
+    tests:   [PLIC/enable, PLIC/threshold]
+    expect:  PASS
+    enabled: false              # set true when the rt-dev adapter is ready
+
+  # full regression (all valid tests)
+  - target:  S5740
+    backend: chipyard
+    config:  RV32CosimConfig
+    tests:   all                # entire S5740.list
+    expect:  PASS
+    enabled: false              # after trigger_irq is completed
+
+# -- benchmark only (benchmark MODE) --
+benchmark:
+  - target:  S5740
+    backend: chipyard           # must be cycle-accurate to be meaningful
+    tests:   [BENCHMARK/dhrystone, BENCHMARK/coremark]
+    metrics: [mcycle, ipc]

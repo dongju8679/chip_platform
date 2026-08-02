@@ -1,0 +1,15 @@
+backend: chipyard
+chipyard: 1.10.0
+rocket-chip: 47f7b7144727f0340d511d35b9f6c7a91b2a276f
+testchipip: 128ccb09f0122651cadff4451cf30cf591636a70
+dut_config: RV32RocketConfig  (WithRV32 ++ WithNBigCores(1) ++ AbstractConfig)
+dram_base: 0x80000000
+verif_addr_override: TEST=0x80010004 BREAK=0x80010000  (DRAM, replaces S5740 values 0x50000/0x51000)
+verified: 2026-06-09 home chipyard_v110 - CLINT_rtc PASS, DEMO_handshake co-sim PASS
+verified: 2026-07-29 chipyard 1.13.0 (vanilla + apply_backend.sh) - RTL 8/8 PASS.
+          apply_backend.sh auto-detects the chipyard version and picks
+          SimTSI.cc.include.v113 (1.13 uses std::map<int, testchip_tsi_t*>).
+          The 'chipyard: 1.10.0' line above is the original baseline, not a ceiling.
+note: on RV32RocketConfig SimExtInterrupts.cc is not part of the build, so
+      apply_backend.sh installs the FAKE testchip_external_interrupts.h stub.
+      That is expected. Use RV32RocketExtConfig for real IRQ injection.

@@ -1,0 +1,36 @@
+#ifndef CHIPYARD_MAP_H
+#define CHIPYARD_MAP_H
+/* chipyard_map.h - rt-dev S5740.h equivalent for chipyard RV32Rocket.
+ *
+ *   rt-dev S5740 (offset-based)     chipyard (absolute, standard SiFive PLIC)
+ *   PLIC_PRIORITY  0x4000     ->    0x0C000000 + id*4
+ *   PLIC_PENDING   0x4100     ->    0x0C001000
+ *   PLIC_ENABLE    0x4200     ->    0x0C002000  (hart0 M-mode)
+ *   PLIC_THRESHOLD 0x5000     ->    0x0C200000  (hart0 M-mode)
+ *   PLIC_CLAIM     0x5004     ->    0x0C200004  (hart0 M-mode)
+ *
+ * NOTE: chipyard RocketI2SRConfig uses WithExtTopInterrupts(48) -> 48 sources.
+ *       PLIC_ENABLE is a 32-bit-per-word bitfield; sources 1..31 live in word 0.
+ *       rt-dev's 64-bit ENABLE access (unsigned long long) is therefore split.
+ */
+
+#define PLIC_BASE                 0x0C000000u
+#define PLIC_NUMBER_OF_INTERRUPTS 48
+#define PLIC_MAX_PRIORITY         0x7
+
+#define PLIC_PRIORITY   (PLIC_BASE + 0x000000u)   /* +id*4              */
+#define PLIC_PENDING    (PLIC_BASE + 0x001000u)
+#define PLIC_ENABLE     (PLIC_BASE + 0x002000u)   /* hart0 M-mode       */
+#define PLIC_THRESHOLD  (PLIC_BASE + 0x200000u)   /* hart0 M-mode       */
+#define PLIC_CLAIM      (PLIC_BASE + 0x200004u)   /* hart0 M-mode       */
+#define PLIC_CLEAR      PLIC_CLAIM
+
+#define BOOT_INTERRUPT  0x1
+
+#define CLINT_SW_INTERRUPT 0x02000000u
+#define CLINT_TIME_LO      0x0200BFF8u
+#define CLINT_TIME_HI      0x0200BFFCu
+#define CLINT_TIMECMP_LO   0x02004000u
+#define CLINT_TIMECMP_HI   0x02004004u
+
+#endif

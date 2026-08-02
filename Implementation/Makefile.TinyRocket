@@ -1,0 +1,80 @@
+# Makefile.TinyRocket  (chip_platform_v2) - first: reproduce existing baremetal PASS
+# Keep the baremetal layout: App/bringup/{common, hello, memory, interrupt}
+#   #include "../common/hal.h" in main.c resolves to common (sibling) as-is (no source change)
+
+RISCV_PREFIX ?= riscv64-unknown-elf-
+CC      = $(RISCV_PREFIX)gcc
+OBJDUMP = $(RISCV_PREFIX)objdump
+
+ARCH ?= rv32imac_zicsr_zifencei
+ABI  ?= ilp32
+
+src_dir    ?= ..
+bringup     = $(src_dir)/verif/core
+bsp_dir     = $(bringup)/common
+common_inc  = $(src_dir)/Platform/Common/Inc
+build_dir   = build
+
+# Verification targets: TEST=hello|memory|interrupt
+TEST ?= hello
+app_dir = $(bringup)/$(TEST)
+
+ASM_SRC = $(wildcard $(bsp_dir)/*.S)
+BSP_SRC = $(wildcard $(bsp_dir)/*.c)
+APP_SRC = $(wildcard $(app_dir)/*.c)
+LDSCRIPT = $(bsp_dir)/link.ld
+
+# -- auto-extract UART address (chipyard version-independent) -----------
+# Read the UART address from serial@<addr> in the chipyard-generated dts and inject via -D.
+#   1.10: serial@54000000 -> 0x54000000,  1.13: serial@10020000 -> 0x10020000
+# Automatic if CHIPYARD/CONFIG are given and dts exists; otherwise use the hal.h default (0x54000000).
+CHIPYARD ?=
+CONFIG   ?= RV32RocketConfig
+DTS = $(CHIPYARD)/sims/verilator/generated-src/chipyard.harness.TestHarness.$(CONFIG)/chipyard.harness.TestHarness.$(CONFIG).dts
+UART_ADDR := $(shell [ -f "$(DTS)" ] && grep -oE 'serial@[0-9a-f]+' "$(DTS)" 2>/dev/null | head -1 | sed 's/serial@//')
+ifneq ($(UART_ADDR),)
+  UART_DEF = -DUART_BASE_ADDR=0x$(UART_ADDR)
+else
+  UART_DEF =
+endif
+
+CFLAGS = -march=$(ARCH) -mabi=$(ABI) -O2 -nostdlib -nostartfiles -ffreestanding -Wall \
+         -I$(bsp_dir) -I$(app_dir) -I$(common_inc) $(UART_DEF)
+LDFLAGS = -T $(LDSCRIPT) -nostdlib -nostartfiles -n
+
+TARGET_ELF = $(build_dir)/$(TEST).elf
+
+all: $(TARGET_ELF)
+
+$(build_dir):
+	mkdir -p $(build_dir)
+
+$(TARGET_ELF): $(ASM_SRC) $(BSP_SRC) $(APP_SRC) $(LDSCRIPT) | $(build_dir)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(ASM_SRC) $(BSP_SRC) $(APP_SRC)
+	$(OBJDUMP) -d $@ > $(build_dir)/$(TEST).dump
+	echo "built: $@"
+
+# quick check (spike must be on PATH after sourcing chipyard env)
+run-spike: $(TARGET_ELF)
+	spike --isa=rv32imac -m0x80000000:0x10000 $(TARGET_ELF)
+
+# main verification (RTL) - delegated to chipyard Verilator sim
+# Config unification (2.5.0): bring-up also uses the same RV32RocketConfig as co-sim.
+#   - past: bring-up=TinyRocketConfig(~/chipyard), co-sim=RV32CosimConfig(~/chipyard_v110)
+#     were separated, but TinyRocketConfig differed by chipyard version (TCM/UART).
+#   - now: bring-up(hello/memory/interrupt) + co-sim(CLINT/PLIC) all
+#     PASS on the chipyard default RV32RocketConfig (WithRV32 ++ WithNBigCores(1) ++ AbstractConfig).
+#     UART=0x54000000 (verif/core/common/hal.h). Unified to a single Config.
+#   - TinyRocketConfig remains in the chipyard default, usable later for minimal-core verification
+#     (call with CONFIG=TinyRocketConfig, but verify that environment's TCM/UART addresses).
+#   Company PCs have different paths, so specifying CHIPYARD=<path> is recommended.
+CHIPYARD ?= $(HOME)/chipyard_v110
+SIM_DIR  ?= $(CHIPYARD)/sims/verilator
+CONFIG   ?= RV32RocketConfig
+run-verilator: $(TARGET_ELF)
+	$(MAKE) -C $(SIM_DIR) run-binary CONFIG=$(CONFIG) BINARY=$(abspath $(TARGET_ELF))
+
+clean:
+	rm -rf $(build_dir)
+
+.PHONY: all run-spike run-verilator clean

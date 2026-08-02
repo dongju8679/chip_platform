@@ -1,0 +1,96 @@
+# S5740.list - chip_platform VERIF case catalog (v301-integrated)
+# format: <FEATURE> <SUB> <status>
+# status: PASS(verified) / CODE(code present, not run) / TODO(planned)
+#
+# This tree is the union of 4 tracks (see chip_docs/verif/docs/INTEGRATED_README.md):
+#   v301(baseline) + v301-baremetal-uart(UART/FreeRTOS)
+#   + v301-ca-test(CA) + v301-benchmark(CoreMark/Dhrystone)
+#
+# FEATURE  SUB          status  note
+PLIC       enable       PASS    IRQ enable/routing co-sim
+PLIC       latency      CODE    CA measurement (PMU latency)
+CLINT      rtc          CODE    RTC self-check
+CLINT      sw_interrupt PASS    CLINT MSIP software interrupt co-sim (baseline regression reference)
+#                               The host Vseq pulses msip 5 times to verify BP/COUNT.
+#                               Requires TRACK=baremetal, +verif=CLINT_sw_interrupt, -DPRELOAD
+#                               (On the chipyard backend fesvr loads the ELF straight into
+#                                 DRAM, and that load is itself the preload, so the host never
+#                                 issues BP_MEM_WRITE. Without it, bp_init() in crt.S stalls
+#                                 inside dut_wait_bp().)
+#                               run: verif/ip/S5740/CLINT/sw_interrupt/run.sh
+#                                    (or ci/run_regress.sh full --only CLINT_sw_interrupt)
+CLINT      timer_interrupt CODE mtimecmp timer interrupt
+#                               NOTE: does not run to completion on RTL (3600s timeout, confirmed).
+#                               The round counts of firmware BP_MAX(50) and host Vseq TMAX(5)
+#                               disagree, and every round the host waits for BP_TEST_init with
+#                               up to 50,000 master_read polls, while that BP is set only once
+#                               at boot by bp_init(). A 50,000-iteration volatile busy-wait per
+#                               round is also excessive for RTL.
+#                               This predates the v302 HAL cleanup (the pre-work control image
+#                               times out at the same point). See
+#                               chip_docs/verif/docs/baremetal.md sections 6.3 / 8.
+#                               The driver was promoted to Platform/Common/Src/timer.c
+#                               (TEST_HAL_MODULES = timer in test.mk)
+UART       printf       PASS    DUT stdout: printf -> _write -> SiFive UART0 @0x10020000
+#                               No host (Vseq). Requires -DPRELOAD; do not pass +verif=.
+#                               run: verif/ip/S5740/UART/printf/run.sh
+FREERTOS   preempt      PASS    FreeRTOS V11.1.0 2-task preemptive scheduling
+#                               RTL result: R21212121212 / RTOSOK c1=103250 c2=103231 s=10 p=1
+#                               (50 min 19 s, EXIT=0). Control experiment: with preemption /
+#                               time-slicing disabled the test never completes, confirming the
+#                               pass depends on preemption alone.
+#                               USE_FREERTOS=1 TRACK=baremetal OPT=-O2, requires -DPRELOAD
+#                               2 tasks with no yield API -> only the tick creates a switch
+#                               Verdict: RTOSOK + c1!=0 && c2!=0 + p=1 + exit code 0
+#                               run: verif/ip/S5740/FREERTOS/preempt/run.sh
+#                               doc: chip_docs/verif/docs/FreeRTOS_port.md
+CA         measure      PASS    execution-driven cycle-accurate cycle measurement (13 blocks)
+#                               Measures per-block cycles and CPI via mcycle/minstret. The host
+#                               master_reads the mailbox table (0x80010100) and prints it.
+#                               UART unused (~43k cycles per character). -DPRELOAD, OPT=-O2.
+#                               Key result: running the same ELF on Spike yields identical
+#                               instruction counts across all 13 blocks, but cycle counts
+#                               differ by up to 14.2x
+#                               (DHIT/DMISS: spike 1041/1041 vs RTL 1052/14814)
+#                               DUT mirror added: Platform/Common/Inc/verif_ca.h
+#                                 verif_ca_mark_cycle() is what finally makes host get_cycle() work
+#                               Address moved: VERIF_CYCLE_LO 0x80010008 -> 0x80010040
+#                                 (the old address collided with I2SR_int_muldiv's BREAK_ADDR)
+#                               run: verif/ip/S5740/CA/measure/run.sh
+#                               doc: chip_docs/verif/docs/CA_measure.md
+BENCH      coremark     PASS    EEMBC CoreMark (upstream unmodified) + in-house porting layer
+#                               USE_BENCH=coremark TRACK=baremetal OPT=-O2, requires -DPRELOAD
+#                               Output goes to the HTIF syscall console, not UART (bench_htif.h).
+#                               Result: 2.391 CoreMark/MHz, CPI 1.334 (836,317 cyc)
+#                               All 5 CRCs match. The 10-second-rule ERROR is expected on RTL.
+#                               run: verif/ip/S5740/BENCH/coremark/run.sh
+#                               doc: chip_docs/verif/docs/benchmark.md
+BENCH      dhrystone    PASS    Dhrystone 2.1 (riscv-tests original, unmodified) + porting layer
+#                               USE_BENCH=dhrystone TRACK=baremetal OPT=-O2, requires -DPRELOAD
+#                               Result: 0.773 DMIPS/MHz, CPI 1.330 (367,928 cyc)
+#                               Self-check (Final values) matches on every item.
+#                               run: verif/ip/S5740/BENCH/dhrystone/run.sh
+#                               doc: chip_docs/verif/docs/benchmark.md
+BENCH      smoke        CODE    Minimal HTIF console path check (pre-flight for the benchmarks)
+I2SR       int_muldiv   PASS    muldiv inside interrupt (CLINT sw + timer)
+#                               extension: external PLIC 5 (isr1~5)
+#                               HW: -DI2SR for fast vector
+#
+# -- cases added by the v302 baremetal HAL cleanup (chip_docs/verif/docs/baremetal.md) --
+EXCEPTION  traps        PASS    exception trap verification (self-check, no host Vseq)
+#                               illegal(2)/ebreak(3)/ecall-M(11)/
+#                               misaligned load(4)/store(6) + mepc and resume check
+#                               shared HAL: exceptions.c + trap_entry.S + boot.c
+#                               Output goes to the HTIF console (htif.h), not UART -
+#                               UART costs 43k cycles per character, so a single marker
+#                               line would take minutes
+#                               TRACK=baremetal, -DPRELOAD, no +verif=
+#                               run: verif/ip/S5740/EXCEPTION/traps/run.sh
+PMP        violation    PASS    PMP violation trap verification (self-check)
+#                               NAPOT encoding / argument checking / readback /
+#                               L=0 has no effect in M-mode / store(7) and load(5) after lock /
+#                               mtval = violating address / lock is sticky /
+#                               unmatched addresses are permitted
+#                               shared HAL: pmp.c + exceptions.c + trap_entry.S
+#                               DUT: pmpregions=8, pmpgranularity=4
+#                               run: verif/ip/S5740/PMP/violation/run.sh

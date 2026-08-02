@@ -1,0 +1,4 @@
+main() lives in Middleware/benchmark/dhrystone/dhrystone_main.c (upstream, unmodified),
+and the porting layer is Middleware/benchmark/dhrystone/port/dhry_port.c.
+So it is normal for this Src/ directory to be empty (the
+FW_SRC = wildcard $(verif_dir)/Src/*.c in Makefile.VERIF yields an empty list).

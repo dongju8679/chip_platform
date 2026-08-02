@@ -1,0 +1,35 @@
+# ca_baseline.txt - CPI regression reference values for the CA execution-driven
+# (spike) blocks
+#
+# What is measured:
+#   From the output of
+#     vp/spike/verif_spike_run build/CA_measure.elf +verif=CA_measure
+#   the per-block CPI and the CONTROLLED PAIRS (pure stall cycles) are extracted
+#   and compared against these references.
+#   Deviating from the reference is a FAIL -> this catches unintended
+#   regressions in the timing model (timing_model.h).
+#
+# Format:  <METRIC>  <expected>  <tolerance>
+#   METRIC          source (spike CA_measure output)
+#   ------          ------------------------------------------------------------
+#   LDUSE_CPI       CPI column of the LDUSE row in the block table
+#                   (CPI including the load-use interlock)
+#   DMISS_CPI       CPI column of the DMISS row in the block table
+#                   (CPI including L1+L2 misses)
+#   LOADUSE_EVENT   CONTROLLED PAIRS: cyc/event of LDUSE-LDINDEP (load-use +1.00)
+#   CACHEMISS_EVENT CONTROLLED PAIRS: cyc/event of DMISS-DHIT    (cache miss +27.00)
+#
+# Verdict:  PASS when |measured - expected| <= tolerance
+#
+# How to update after deliberately changing the model:
+#     ci/run_regress.sh --update-baseline
+#   This rewrites the expected column of this file with the current spike
+#   measurements (tolerances are preserved).
+#   The commit diff records "what changed and by how much", so confirm in review
+#   that the change was intended.
+#   Tolerances are maintained by hand (they set the regression sensitivity).
+
+LDUSE_CPI        1.497   0.05
+DMISS_CPI        14.461  0.20
+LOADUSE_EVENT    1.00    0.05
+CACHEMISS_EVENT  27.00   0.50
